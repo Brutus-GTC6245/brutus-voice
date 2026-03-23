@@ -39,6 +39,7 @@ pub struct Config {
     /// RMS amplitude below which audio is treated as silence (default: 0.01)
     #[serde(default = "default_silence_threshold")]
     pub silence_threshold: f32,
+
 }
 
 fn default_min_record_seconds() -> f32 { 0.5 }

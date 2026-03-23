@@ -11,5 +11,6 @@
   "min_record_seconds": 0.5,
   "max_record_seconds": 30.0,
   "silence_timeout": 2.0,
-  "wake_word_enabled": false
+  "wake_word_enabled": false,
+  "barge_in_threshold": 0.0
 }

@@ -171,24 +171,25 @@ async fn main() -> Result<()> {
         info!("brutus: {reply}");
         state.push("assistant", &reply);
 
-        // Phase 5 — pipelined chunked TTS with barge-in
-        let cfg_tts   = cfg.clone();
-        let reply_tts = reply.clone();
-        let buf_tts   = Arc::clone(&audio_buf);
-        let barged_in = match tokio::task::spawn_blocking(
-            move || tts::speak_chunked(&cfg_tts, &reply_tts, buf_tts)
+        // Phase 5 — pipelined chunked TTS with wake-word barge-in
+        // Always provide models_dir for barge-in, regardless of --no-wake
+        let cfg_tts    = cfg.clone();
+        let reply_tts  = reply.clone();
+        let buf_tts    = Arc::clone(&audio_buf);
+        let models_dir = Some(cli.models.clone());
+        let sr         = native_sr;
+        let threshold  = cli.threshold;
+        let barged_in  = match tokio::task::spawn_blocking(
+            move || tts::speak_chunked(&cfg_tts, &reply_tts, buf_tts, sr, threshold, models_dir)
         ).await.context("TTS thread panicked")? {
             Ok(v)  => v,
             Err(e) => { error!("TTS: {e:#}"); false }
         };
 
         if barged_in {
-            // User spoke while we were talking — their voice is already in the
-            // mic buffer from the barge-in monitor. Go straight to VAD.
-            info!("barge-in: recording follow-up immediately");
+            info!("barge-in: going straight to VAD recording");
             audio_buf.lock().unwrap().clear();
         }
-        // Either way, loop continues to Phase 1/2 — if barged_in the buffer
-        // already has speech so VAD will trigger immediately.
+        // Loop continues — barge-in or normal, next iteration handles recording.
     }
 }
