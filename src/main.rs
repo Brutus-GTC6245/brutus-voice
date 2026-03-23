@@ -12,7 +12,7 @@ use clap::Parser;
 use std::{path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 use tracing::{debug, error, info};
 
-use audio_capture::{open_input_stream, resample, rms, write_wav, SAMPLE_RATE};
+use audio_capture::{open_input_stream, record_vad, resample, rms, write_wav, SAMPLE_RATE};
 use config::Config;
 use state::AppState;
 use wake_word::WakeDetector;
@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long, default_value = "0.5")]
     threshold: f32,
 
-    /// Disable wake word — record every N seconds continuously
+    /// Disable wake word — record every turn using VAD only
     #[arg(long)]
     no_wake: bool,
 
@@ -81,28 +81,33 @@ async fn main() -> Result<()> {
     // ── Microphone stream → shared ring buffer ────────────────────────────────
     let audio_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let (_stream, native_sr) = open_input_stream(Arc::clone(&audio_buf))?;
-    // `_stream` must remain alive for the duration of the program
 
     // ── Wake-word detector ────────────────────────────────────────────────────
     let mut detector: Option<WakeDetector> = if cli.no_wake {
-        info!("wake word disabled — recording continuously");
+        info!("wake word disabled — VAD-only mode");
         None
     } else {
         info!("loading wake-word models from {}", cli.models.display());
         Some(WakeDetector::new(&cli.models)?)
     };
 
-    info!("ready — {}", if cli.no_wake { "recording continuously" } else { "say 'Hey Jarvis'" });
+    info!(
+        "ready — {} | VAD: min={:.1}s silence={:.1}s max={:.0}s",
+        if cli.no_wake { "VAD-only" } else { "say 'Hey Jarvis'" },
+        cfg.min_record_seconds,
+        cfg.silence_timeout,
+        cfg.max_record_seconds,
+    );
 
-    let record_dur     = Duration::from_secs(cfg.record_seconds);
-    let tick           = Duration::from_millis(20);
-    let record_samples = (native_sr as u64 * cfg.record_seconds) as usize;
+    let tick = Duration::from_millis(20);
 
     // ── Main voice loop ───────────────────────────────────────────────────────
     loop {
-        // Phase 1 — wait for wake word (or fill buffer in no-wake mode)
+        // Phase 1 — wait for wake word (or skip in no-wake mode)
         if let Some(det) = &mut detector {
             info!("listening for wake word…");
+            // Drain buffer so wake detector only sees fresh audio
+            audio_buf.lock().unwrap().clear();
             loop {
                 tokio::time::sleep(tick).await;
                 let chunk: Vec<f32> = audio_buf.lock().unwrap().drain(..).collect();
@@ -119,25 +124,26 @@ async fn main() -> Result<()> {
                     _ => {}
                 }
             }
-        } else {
-            loop {
-                tokio::time::sleep(tick).await;
-                if audio_buf.lock().unwrap().len() >= record_samples { break; }
-            }
         }
 
-        // Phase 2 — record for `record_seconds`
-        info!("recording {}s…", cfg.record_seconds);
-        audio_buf.lock().unwrap().clear();
-        tokio::time::sleep(record_dur).await;
+        // Phase 2 — VAD recording: capture until silence or max duration
+        info!("recording (VAD)…");
+        let raw = record_vad(
+            &audio_buf,
+            native_sr,
+            cfg.silence_threshold,
+            cfg.silence_timeout,
+            cfg.min_record_seconds,
+            cfg.max_record_seconds,
+        ).await;
 
-        let raw     = audio_buf.lock().unwrap().drain(..).collect::<Vec<_>>();
         let samples = resample(raw, native_sr);
         let amp     = rms(&samples);
-        debug!("RMS={amp:.5}");
+        debug!("recorded {:.2}s, RMS={amp:.5}",
+            samples.len() as f32 / SAMPLE_RATE as f32);
 
         if amp < cfg.silence_threshold {
-            info!("silence (RMS {amp:.5}), skipping");
+            info!("all silence, skipping");
             continue;
         }
 
@@ -165,13 +171,12 @@ async fn main() -> Result<()> {
         info!("brutus: {reply}");
         state.push("assistant", &reply);
 
-        // Phase 5 — text-to-speech
-        let cmd       = cfg.tts_command.clone();
+        // Phase 5 — pipelined chunked TTS
+        let cfg_tts   = cfg.clone();
         let reply_tts = reply.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || tts::speak(&cmd, &reply_tts))
-            .await
-            .context("TTS thread panicked")?
-        {
+        if let Err(e) = tokio::task::spawn_blocking(
+            move || tts::speak_chunked(&cfg_tts, &reply_tts)
+        ).await.context("TTS thread panicked")? {
             error!("TTS: {e:#}");
         }
     }

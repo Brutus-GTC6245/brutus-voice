@@ -5,6 +5,10 @@
   "tts_command": [
     "/Users/brutus/Projects/brutus-voice/speak.sh"
   ],
-  "record_seconds": 6,
-  "silence_threshold": 0.01
+  "silence_threshold": 0.01,
+  "piper_binary": "/Users/brutus/.openclaw/voice-env/bin/piper",
+  "piper_model": "/Users/brutus/.openclaw/voice-models/ryan-high.onnx",
+  "min_record_seconds": 0.5,
+  "max_record_seconds": 30.0,
+  "silence_timeout": 2.0
 }
