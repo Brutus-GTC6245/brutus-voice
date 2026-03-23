@@ -24,35 +24,73 @@ pub fn speak_simple(tts_command: &[String], text: &str) -> Result<()> {
 }
 
 // ── Chunk splitting ───────────────────────────────────────────────────────────
+//
+// Split on punctuation that marks a natural speech pause.
+// The delimiter itself is stripped — Piper should not say "comma" or "dash".
+// Minimum chunk length avoids tiny fragments like a single word after a colon.
 
-const WORDS_PER_CHUNK: usize = 8;
+const MIN_CHUNK_WORDS: usize = 3;
+
+/// Characters that act as chunk delimiters (stripped from output).
+fn is_delimiter(ch: char) -> bool {
+    matches!(ch, '.' | ',' | '!' | '?' | ':' | ';' | '-' | '–' | '—' | '\n')
+}
 
 pub fn split_chunks(text: &str) -> Vec<String> {
-    let mut sentences: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        current.push(ch);
-        if matches!(ch, '.' | '!' | '?') {
-            let s = current.trim().to_string();
-            if !s.is_empty() { sentences.push(s); }
-            current.clear();
-        }
-    }
-    if !current.trim().is_empty() { sentences.push(current.trim().to_string()); }
-
     let mut chunks: Vec<String> = Vec::new();
-    for sentence in sentences {
-        let words: Vec<&str> = sentence.split_whitespace().collect();
-        for group in words.chunks(WORDS_PER_CHUNK) {
-            let c = group.join(" ");
-            if !c.is_empty() { chunks.push(c); }
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        if is_delimiter(ch) {
+            let candidate = current.trim().to_string();
+            // Only emit if long enough — avoids tiny orphan fragments
+            let word_count = candidate.split_whitespace().count();
+            if word_count >= MIN_CHUNK_WORDS {
+                chunks.push(candidate);
+                current.clear();
+            } else if !candidate.is_empty() {
+                // Too short: keep accumulating (append a space for readability)
+                current.push(' ');
+            }
+        } else {
+            current.push(ch);
         }
     }
+
+    // Flush remainder
+    let tail = current.trim().to_string();
+    if !tail.is_empty() {
+        if let Some(last) = chunks.last_mut() {
+            // Merge short tail into previous chunk
+            if tail.split_whitespace().count() < MIN_CHUNK_WORDS {
+                last.push(' ');
+                last.push_str(&tail);
+                return chunks;
+            }
+        }
+        chunks.push(tail);
+    }
+
+    // Fallback: if nothing split, return whole text
     if chunks.is_empty() {
         let s = text.trim().to_string();
         if !s.is_empty() { chunks.push(s); }
     }
+
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_chunks;
+    #[test]
+    fn test_split_basic() {
+        let chunks = split_chunks("Hello there. How are you doing today? I'm doing great, thanks!");
+        println!("{chunks:?}");
+        assert!(chunks.len() >= 2);
+        // No chunk should contain a raw delimiter at the end
+        for c in &chunks { assert!(!c.ends_with('.') && !c.ends_with(',')) }
+    }
 }
 
 // ── Piper synthesis ───────────────────────────────────────────────────────────
