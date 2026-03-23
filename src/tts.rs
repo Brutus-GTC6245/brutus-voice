@@ -82,52 +82,63 @@ fn piper_synthesise(bin: &str, model: &str, text: &str) -> Result<tempfile::Name
 
 pub type StopFlag = Arc<Mutex<bool>>;
 
-/// Spawn a background thread that feeds `audio_buf` through `detector`
-/// and sets `stop_flag` when the wake word fires above `threshold`.
+/// Spawn a background thread that monitors `audio_buf` with Silero VAD.
+/// Sets `stop_flag` and kills afplay when speech is detected above `threshold`.
 ///
-/// Returns a join handle (can be dropped — thread is detached on interrupt).
+/// Silero VAD is pre-loaded before the thread starts, so there is no startup
+/// delay once TTS begins playing.
 pub fn spawn_barge_in_monitor(
     audio_buf: Arc<Mutex<Vec<f32>>>,
     native_sr: u32,
-    threshold: f32,
+    threshold: f32,   // Silero speech probability, e.g. 0.5
     stop_flag: StopFlag,
     afplay_pid: Arc<Mutex<Option<u32>>>,
     models_dir: std::path::PathBuf,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        use crate::audio_capture::resample;
-        use crate::wake_word::WakeDetector;
+) -> Result<thread::JoinHandle<()>> {
+    use crate::audio_capture::resample;
+    use crate::wake_word::SileroVad;
 
-        let mut det = match WakeDetector::new(&models_dir) {
-            Ok(d)  => d,
-            Err(e) => { warn!("barge-in detector failed to load: {e:#}"); return; }
-        };
+    // Load VAD synchronously BEFORE spawning so the thread starts ready
+    let mut vad = SileroVad::new(&models_dir)?;
+    vad.reset();
 
+    const CHUNK: usize = SileroVad::CHUNK_SAMPLES; // 512 samples @ 16 kHz
+    let mut remainder: Vec<f32> = Vec::new();
+
+    Ok(thread::spawn(move || {
         loop {
-            // Exit if stop already set (TTS finished normally)
             if *stop_flag.lock().unwrap() { return; }
 
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(15));
 
-            let chunk: Vec<f32> = audio_buf.lock().unwrap().drain(..).collect();
-            if chunk.is_empty() { continue; }
+            let new: Vec<f32> = audio_buf.lock().unwrap().drain(..).collect();
+            if new.is_empty() { continue; }
 
-            let chunk16 = resample(chunk, native_sr);
-            match det.process(&chunk16) {
-                Ok(Some(score)) if score >= threshold => {
-                    info!("barge-in: wake word detected (score={score:.3})");
-                    *stop_flag.lock().unwrap() = true;
-                    // Kill afplay if running
-                    if let Some(pid) = *afplay_pid.lock().unwrap() {
-                        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            // Resample to 16 kHz if needed
+            let resampled = resample(new, native_sr);
+            remainder.extend_from_slice(&resampled);
+
+            while remainder.len() >= CHUNK {
+                let chunk: Vec<f32> = remainder.drain(..CHUNK).collect();
+                match vad.process(&chunk) {
+                    Ok(score) => {
+                        debug!("silero vad: {score:.3}");
+                        if score >= threshold {
+                            info!("barge-in: speech detected (silero={score:.3})");
+                            *stop_flag.lock().unwrap() = true;
+                            if let Some(pid) = *afplay_pid.lock().unwrap() {
+                                let _ = Command::new("kill")
+                                    .args(["-9", &pid.to_string()])
+                                    .status();
+                            }
+                            return;
+                        }
                     }
-                    return;
+                    Err(e) => warn!("silero vad error: {e:#}"),
                 }
-                Err(e) => { warn!("barge-in detector: {e:#}"); }
-                _ => {}
             }
         }
-    })
+    }))
 }
 
 // ── Play WAV with barge-in watch ─────────────────────────────────────────────
@@ -174,7 +185,6 @@ pub fn speak_chunked(
     text: &str,
     audio_buf: Arc<Mutex<Vec<f32>>>,
     native_sr: u32,
-    wake_threshold: f32,
     models_dir: Option<std::path::PathBuf>,
 ) -> Result<bool> {
     let (Some(piper_bin), Some(piper_model)) =
@@ -194,17 +204,22 @@ pub fn speak_chunked(
     let stop_flag: StopFlag = Arc::new(Mutex::new(false));
     let afplay_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
-    // Start barge-in monitor if models_dir provided
-    let _monitor = models_dir.map(|dir| {
-        spawn_barge_in_monitor(
+    // Start Silero VAD barge-in monitor if models_dir provided
+    let _monitor = if let Some(dir) = models_dir {
+        match spawn_barge_in_monitor(
             Arc::clone(&audio_buf),
             native_sr,
-            wake_threshold,
+            0.5, // Silero speech probability threshold
             Arc::clone(&stop_flag),
             Arc::clone(&afplay_pid),
             dir,
-        )
-    });
+        ) {
+            Ok(h)  => Some(h),
+            Err(e) => { warn!("barge-in monitor failed to start: {e:#}"); None }
+        }
+    } else {
+        None
+    };
 
     let piper_bin   = piper_bin.to_string();
     let piper_model = piper_model.to_string();

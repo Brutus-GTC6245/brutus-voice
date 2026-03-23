@@ -178,9 +178,8 @@ async fn main() -> Result<()> {
         let buf_tts    = Arc::clone(&audio_buf);
         let models_dir = Some(cli.models.clone());
         let sr         = native_sr;
-        let threshold  = cli.threshold;
         let barged_in  = match tokio::task::spawn_blocking(
-            move || tts::speak_chunked(&cfg_tts, &reply_tts, buf_tts, sr, threshold, models_dir)
+            move || tts::speak_chunked(&cfg_tts, &reply_tts, buf_tts, sr, models_dir)
         ).await.context("TTS thread panicked")? {
             Ok(v)  => v,
             Err(e) => { error!("TTS: {e:#}"); false }

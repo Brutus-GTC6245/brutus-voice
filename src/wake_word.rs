@@ -152,3 +152,68 @@ impl WakeDetector {
         Ok(Some(score))
     }
 }
+
+// ── Silero VAD ────────────────────────────────────────────────────────────────
+// Lightweight speech-activity detector. Works at the amplitude level the
+// P610 actually produces — unlike RMS thresholds.
+//
+// Input:  audio chunk of exactly 512 samples @ 16 kHz  [1, 512] f32
+// Output: speech probability in [0, 1]
+// State:  h, c (LSTM hidden state) must be preserved between calls
+
+pub struct SileroVad {
+    session: Session,
+    h: Vec<f32>,  // [2, 1, 64]
+    c: Vec<f32>,  // [2, 1, 64]
+}
+
+impl SileroVad {
+    pub const CHUNK_SAMPLES: usize = 512; // 32 ms at 16 kHz
+
+    pub fn new(models_dir: &Path) -> Result<Self> {
+        let path = models_dir.join("silero_vad.onnx");
+        if !path.exists() {
+            bail!("silero_vad.onnx not found in {}", models_dir.display());
+        }
+        Ok(Self {
+            session: Session::builder()?.commit_from_file(&path)
+                .context("loading silero_vad.onnx")?,
+            h: vec![0.0f32; 2 * 1 * 64],
+            c: vec![0.0f32; 2 * 1 * 64],
+        })
+    }
+
+    /// Reset LSTM state (call between utterances).
+    pub fn reset(&mut self) {
+        self.h.fill(0.0);
+        self.c.fill(0.0);
+    }
+
+    /// Run one 512-sample chunk. Returns speech probability [0, 1].
+    pub fn process(&mut self, chunk: &[f32]) -> Result<f32> {
+        assert_eq!(chunk.len(), Self::CHUNK_SAMPLES, "chunk must be exactly 512 samples");
+
+        let audio = Tensor::<f32>::from_array(
+            (vec![1i64, Self::CHUNK_SAMPLES as i64], chunk.to_vec()))?;
+        let sr = Tensor::<i64>::from_array(
+            (vec![0i64; 0], vec![16000i64]))?;
+        let h_in = Tensor::<f32>::from_array(
+            (vec![2i64, 1, 64], self.h.clone()))?;
+        let c_in = Tensor::<f32>::from_array(
+            (vec![2i64, 1, 64], self.c.clone()))?;
+
+        let out = self.session.run(
+            ort::inputs!["input" => audio, "sr" => sr, "h" => h_in, "c" => c_in])?;
+
+        let (_, prob) = out[0].try_extract_tensor::<f32>()?;
+        let score = prob.first().copied().unwrap_or(0.0);
+
+        // Update LSTM state
+        let (_, hn) = out[1].try_extract_tensor::<f32>()?;
+        let (_, cn) = out[2].try_extract_tensor::<f32>()?;
+        self.h = hn.to_vec();
+        self.c = cn.to_vec();
+
+        Ok(score)
+    }
+}
