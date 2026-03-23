@@ -1,0 +1,8 @@
+{
+  "api_url": "http://localhost:3000/v1",
+  "api_key": "your-api-key-here",
+  "whisper_url": "http://localhost:9000/asr",
+  "tts_command": ["say", "-v", "Samantha", "-r", "185"],
+  "record_seconds": 6,
+  "silence_threshold": 0.01
+}
