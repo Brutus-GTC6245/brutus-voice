@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::{
     io::Write,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::Duration,
